@@ -18,6 +18,9 @@
 #include <time.h>
 #include <pthread.h>
 
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
+
 #define BUF_SIZE 2048
 #define MICROSECONDS_IN_SECOND 1000000
 #define NANOSECONDS_IN_SECOND 1000000000
@@ -36,6 +39,15 @@ static int stackprof_use_postponed_job = 1;
 static int ruby_vm_running = 0;
 
 #define TOTAL_FAKE_FRAMES (sizeof(fake_frame_cstrs) / sizeof(char *))
+
+static uint64_t
+read_instruction_count(int fd) {
+    uint64_t count = 0;
+    if (fd)
+    	read(fd, &count, sizeof(count));
+    return count;
+}
+
 
 #ifdef _POSIX_MONOTONIC_CLOCK
   #define timestamp_t timespec
@@ -89,6 +101,7 @@ typedef struct {
 typedef struct {
     uint64_t timestamp_usec;
     int64_t delta_usec;
+    uint64_t instruction_count;
 } sample_time_t;
 
 static struct {
@@ -129,12 +142,15 @@ static struct {
     int lines_buffer[BUF_SIZE];
 
     pthread_t target_thread;
+
+    int perf_event_fd;
 } _stackprof;
 
 static VALUE sym_object, sym_wall, sym_cpu, sym_custom, sym_name, sym_file, sym_line;
 static VALUE sym_samples, sym_total_samples, sym_missed_samples, sym_edges, sym_lines;
 static VALUE sym_version, sym_mode, sym_interval, sym_raw, sym_metadata, sym_frames, sym_ignore_gc, sym_out;
 static VALUE sym_aggregate, sym_raw_sample_timestamps, sym_raw_timestamp_deltas, sym_state, sym_marking, sym_sweeping;
+static VALUE sym_raw_instruction_counts, sym_instruction_counts;
 static VALUE sym_gc_samples, objtracer;
 static VALUE gc_hook;
 static VALUE rb_mStackProf;
@@ -149,7 +165,7 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     struct itimerval timer;
     VALUE opts = Qnil, mode = Qnil, interval = Qnil, metadata = rb_hash_new(), out = Qfalse;
     int ignore_gc = 0;
-    int raw = 0, aggregate = 1;
+    int raw = 0, aggregate = 1, instruction_counts = 0;
     VALUE metadata_val;
 
     if (_stackprof.running)
@@ -175,6 +191,8 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
 
 	if (RTEST(rb_hash_aref(opts, sym_raw)))
 	    raw = 1;
+	if (RTEST(rb_hash_aref(opts, sym_instruction_counts)))
+	    instruction_counts = 1;
 	if (rb_hash_lookup2(opts, sym_aggregate, Qundef) == Qfalse)
 	    aggregate = 0;
     }
@@ -224,9 +242,28 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     _stackprof.metadata = metadata;
     _stackprof.out = out;
     _stackprof.target_thread = pthread_self();
+    _stackprof.perf_event_fd = 0;
 
     if (raw) {
 	capture_timestamp(&_stackprof.last_sample_at);
+    }
+
+    if (instruction_counts) {
+    	fprintf(stderr, "StackProf: capturing instruction counts\n");
+    	struct perf_event_attr attr;
+    	memset(&attr, 0, sizeof(attr));
+    	attr.type = PERF_TYPE_HARDWARE;
+    	attr.size = sizeof(attr);
+    	attr.config = PERF_COUNT_HW_INSTRUCTIONS;
+    	attr.disabled = 0;
+    	attr.exclude_kernel = 1;
+    	attr.exclude_hv = 1;
+
+    	_stackprof.perf_event_fd = syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+    	if (_stackprof.perf_event_fd == -1) {
+    	    fprintf(stderr, "StackProf: failed to open perf event: %s\n", strerror(errno));
+    	    _stackprof.perf_event_fd = 0;
+    	}
     }
 
     return Qtrue;
@@ -241,6 +278,10 @@ stackprof_stop(VALUE self)
     if (!_stackprof.running)
 	return Qfalse;
     _stackprof.running = 0;
+
+    if (_stackprof.perf_event_fd)  {
+    	close(_stackprof.perf_event_fd);
+    }
 
     if (_stackprof.mode == sym_object) {
 	rb_tracepoint_disable(objtracer);
@@ -372,7 +413,7 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 
     if (_stackprof.raw && _stackprof.raw_samples_len) {
 	size_t len, n, o;
-	VALUE raw_sample_timestamps, raw_timestamp_deltas;
+	VALUE raw_sample_timestamps, raw_timestamp_deltas, raw_instruction_counts;
 	VALUE raw_samples = rb_ary_new_capa(_stackprof.raw_samples_len);
 
 	for (n = 0; n < _stackprof.raw_samples_len; n++) {
@@ -394,10 +435,16 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 
 	raw_sample_timestamps = rb_ary_new_capa(_stackprof.raw_sample_times_len);
 	raw_timestamp_deltas = rb_ary_new_capa(_stackprof.raw_sample_times_len);
+	if (_stackprof.perf_event_fd) 
+	    raw_instruction_counts = rb_ary_new_capa(_stackprof.raw_sample_times_len);
+	else
+	    raw_instruction_counts = rb_ary_new_capa(0);
 
 	for (n = 0; n < _stackprof.raw_sample_times_len; n++) {
 	    rb_ary_push(raw_sample_timestamps, ULL2NUM(_stackprof.raw_sample_times[n].timestamp_usec));
 	    rb_ary_push(raw_timestamp_deltas, LL2NUM(_stackprof.raw_sample_times[n].delta_usec));
+	    if (_stackprof.perf_event_fd)
+	    	rb_ary_push(raw_instruction_counts, LL2NUM(_stackprof.raw_sample_times[n].instruction_count));
 	}
 
 	free(_stackprof.raw_sample_times);
@@ -407,6 +454,7 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 
 	rb_hash_aset(results, sym_raw_sample_timestamps, raw_sample_timestamps);
 	rb_hash_aset(results, sym_raw_timestamp_deltas, raw_timestamp_deltas);
+	rb_hash_aset(results, sym_raw_instruction_counts, raw_instruction_counts);
 
 	_stackprof.raw = 0;
     }
@@ -560,6 +608,7 @@ stackprof_record_sample_for_stack(int num, uint64_t sample_timestamp, int64_t ti
 	_stackprof.raw_sample_times[_stackprof.raw_sample_times_len++] = (sample_time_t) {
 	    .timestamp_usec = sample_timestamp,
 	    .delta_usec = timestamp_delta,
+	    .instruction_count = read_instruction_count(_stackprof.perf_event_fd),
         };
     }
 
@@ -605,6 +654,7 @@ stackprof_buffer_sample(void)
 {
     uint64_t start_timestamp = 0;
     int64_t timestamp_delta = 0;
+    uint64_t instruction_count = 0;
     int num;
 
     if (_stackprof.buffer_count > 0) {
@@ -617,6 +667,7 @@ stackprof_buffer_sample(void)
 	capture_timestamp(&t);
 	start_timestamp = timestamp_usec(&t);
 	timestamp_delta = delta_usec(&_stackprof.last_sample_at, &t);
+	instruction_count = read_instruction_count(_stackprof.perf_event_fd);
     }
 
     num = rb_profile_frames(0, sizeof(_stackprof.frames_buffer) / sizeof(VALUE), _stackprof.frames_buffer, _stackprof.lines_buffer);
@@ -624,6 +675,7 @@ stackprof_buffer_sample(void)
     _stackprof.buffer_count = num;
     _stackprof.buffer_time.timestamp_usec = start_timestamp;
     _stackprof.buffer_time.delta_usec = timestamp_delta;
+    _stackprof.buffer_time.instruction_count = instruction_count;
 }
 
 void
@@ -893,8 +945,10 @@ Init_stackprof(void)
     S(mode);
     S(interval);
     S(raw);
+    S(instruction_counts);
     S(raw_sample_timestamps);
     S(raw_timestamp_deltas);
+    S(raw_instruction_counts);
     S(out);
     S(metadata);
     S(ignore_gc);

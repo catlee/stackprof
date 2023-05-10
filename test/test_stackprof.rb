@@ -295,6 +295,20 @@ class StackProfTest < MiniTest::Test
     end
   end
 
+  def test_instr_counts
+    profile = StackProf.run(mode: :wall, instruction_counts: true, raw: true) do
+      math
+    end
+
+    assert profile[:raw_instruction_counts].length > 0
+
+    profile = StackProf.run(mode: :wall, instruction_counts: false, raw: true) do
+      math
+    end
+
+    assert profile[:raw_instruction_counts].length == 0
+  end
+
   def math
     250_000.times do
       2 ** 10
